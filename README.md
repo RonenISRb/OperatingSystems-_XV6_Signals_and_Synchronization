@@ -1,4 +1,4 @@
-# OperatingSystems-_XV6_Signals_and_Synchronization
+# OperatingSystems_XV6_Signals_and_Synchronization
 
 
 The assignment main goal is to teach you about XV6 synchronization mechanisms and process management.
