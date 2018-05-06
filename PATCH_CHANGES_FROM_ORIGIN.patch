@@ -1,0 +1,1130 @@
+diff --git a/Makefile b/Makefile
+index a55abd2..219ced2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -27,6 +27,7 @@ OBJS = \
+ 	uart.o\
+ 	vectors.o\
+ 	vm.o\
++	call_sigret.o\
+ 
+ # Cross-compiling (e.g., on Mac OS X)
+ # TOOLPREFIX = i386-jos-elf
+@@ -174,6 +175,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_sig_sanity\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -241,7 +243,7 @@ qemu-nox-gdb: fs.img xv6.img .gdbinit
+ # check in that version.
+ 
+ EXTRA=\
+-	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
++	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c sig_sanity.c\
+ 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
+ 	printf.c umalloc.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+diff --git a/call_sigret.S b/call_sigret.S
+new file mode 100644
+index 0000000..7cf2a52
+--- /dev/null
++++ b/call_sigret.S
+@@ -0,0 +1,10 @@
++#include "syscall.h"
++#include "traps.h"
++
++.globl call_sigret_start
++.globl call_sigret_end
++
++call_sigret_start:
++	mov $SYS_sigret, %eax
++	int $T_SYSCALL
++call_sigret_end:
+\ No newline at end of file
+diff --git a/defs.h b/defs.h
+index 82fb982..51b6655 100644
+--- a/defs.h
++++ b/defs.h
+@@ -10,6 +10,16 @@ struct sleeplock;
+ struct stat;
+ struct superblock;
+ 
++//Task 2.1
++uint sigprocmask(uint sig_mask);
++sighandler_t signal(int signum, sighandler_t handler);
++void sigret(void);
++
++// Task 2.4
++// call_sigret.S
++void			call_sigret_start(void);
++void			call_sigret_end(void);
++
+ // bio.c
+ void            binit(void);
+ struct buf*     bread(uint, uint);
+@@ -107,7 +117,7 @@ int             cpuid(void);
+ void            exit(void);
+ int             fork(void);
+ int             growproc(int);
+-int             kill(int);
++int             kill(int, int);
+ struct cpu*     mycpu(void);
+ struct proc*    myproc();
+ void            pinit(void);
+diff --git a/exec.c b/exec.c
+index b40134f..f0fffac 100644
+--- a/exec.c
++++ b/exec.c
+@@ -99,6 +99,14 @@ exec(char *path, char **argv)
+   curproc->sz = sz;
+   curproc->tf->eip = elf.entry;  // main
+   curproc->tf->esp = sp;
++  
++   // Task 2.1.2
++   for(int i = 0; i < SIG_SIZE; i++){
++    if(curproc->signal_handlers[i] != (void*)SIG_DFL && curproc->signal_handlers[i] != (void*)SIG_IGN){
++		curproc->signal_handlers[i] = (void*)SIG_DFL; 
++	}
++  }
++  
+   switchuvm(curproc);
+   freevm(oldpgdir);
+   return 0;
+diff --git a/kill.c b/kill.c
+index 364f6af..1139610 100644
+--- a/kill.c
++++ b/kill.c
+@@ -7,11 +7,11 @@ main(int argc, char **argv)
+ {
+   int i;
+ 
+-  if(argc < 2){
++  if(argc < 3){
+     printf(2, "usage: kill pid...\n");
+     exit();
+   }
+-  for(i=1; i<argc; i++)
+-    kill(atoi(argv[i]));
++  for(i=1; i<argc; i+=2)
++    kill(atoi(argv[i]), atoi(argv[i+1]));
+   exit();
+ }
+diff --git a/param.h b/param.h
+index a7e90ef..1173829 100644
+--- a/param.h
++++ b/param.h
+@@ -12,3 +12,12 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       1000  // size of file system in blocks
+ 
++//Task 2.1.1
++#define SIG_DFL -1
++#define SIG_IGN 1
++
++#define SIGKILL 9
++#define SIGSTOP 17
++#define SIGCONT 19
++
++#define SIG_SIZE 32
+\ No newline at end of file
+diff --git a/proc.c b/proc.c
+index 2a6b641..4d960f5 100644
+--- a/proc.c
++++ b/proc.c
+@@ -65,18 +65,20 @@ myproc(void) {
+   return p;
+ }
+ 
+-
+ int 
+ allocpid(void) 
+ {
+-  int pid;
+-  acquire(&ptable.lock);
+-  pid = nextpid++;
+-  release(&ptable.lock);
+-  return pid;
++   int pid;
++   pushcli();
++   do{
++      pid = nextpid;
++   }
++   while(!cas(&nextpid, pid, pid+1));
++	
++   popcli();
++   return pid+1;
+ }
+ 
+-
+ //PAGEBREAK: 32
+ // Look in the process table for an UNUSED proc.
+ // If found, change state to EMBRYO and initialize
+@@ -87,22 +89,25 @@ allocproc(void)
+ {
+   struct proc *p;
+   char *sp;
+-
+-  acquire(&ptable.lock);
+-
+-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+-    if(p->state == UNUSED)
+-      goto found;
+-
+-  release(&ptable.lock);
+-  return 0;
+-
+-found:
+-  p->state = EMBRYO;
+-  release(&ptable.lock);
++  
++  //Task 4
++  pushcli();
++  do{
++	 for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++		if(p->state == UNUSED){
++			break;			
++		}			
++	 }
++	 if(p == ptable.proc + NPROC){
++		popcli();
++		return 0;
++	 }
++  } while(!cas(&p->state, UNUSED, EMBRYO));
++  popcli();
++  //End task 4
++  
+   p->pid = allocpid();
+ 
+-
+   // Allocate kernel stack.
+   if((p->kstack = kalloc()) == 0){
+     p->state = UNUSED;
+@@ -123,7 +128,16 @@ found:
+   p->context = (struct context*)sp;
+   memset(p->context, 0, sizeof *p->context);
+   p->context->eip = (uint)forkret;
+-
++  
++    //Task 2
++  for(int i = 0; i < SIG_SIZE; i++){
++    p->signal_handlers[i] = (void*)SIG_DFL;
++  }
++  p->signal_mask = 0;
++  p->pending_signals = 0;
++  p->sig_stopped = 0;
++  //End task 2
++  
+   return p;
+ }
+ 
+@@ -158,11 +172,14 @@ userinit(void)
+   // run this process. the acquire forces the above
+   // writes to be visible, and the lock is also needed
+   // because the assignment might not be atomic.
+-  acquire(&ptable.lock);
+-
+-  p->state = RUNNABLE;
+-
+-  release(&ptable.lock);
++  
++  //Task 4
++  pushcli();
++  if(!cas(&p->state, EMBRYO, RUNNABLE)){
++    panic("\t***** CAS:User init failed.");
++  }
++  popcli();
++  //End task 4
+ }
+ 
+ // Grow current process's memory by n bytes.
+@@ -224,11 +241,20 @@ fork(void)
+ 
+   pid = np->pid;
+ 
+-  acquire(&ptable.lock);
+-
+-  np->state = RUNNABLE;
+-
+-  release(&ptable.lock);
++  //Task 2.1.2
++  for(int i = 0; i < SIG_SIZE; i++){
++    np->signal_handlers[i] = curproc-> signal_handlers[i];
++  }
++  np->signal_mask = curproc->signal_mask;
++  //End task 2
++  
++  //Task 4
++  pushcli();
++  if(!cas(&np->state, EMBRYO, RUNNABLE)){
++        panic("\t***** CAS:Fork failed.");
++  }
++  popcli();
++  //End task 4
+ 
+   return pid;
+ }
+@@ -259,7 +285,9 @@ exit(void)
+   end_op();
+   curproc->cwd = 0;
+ 
+-  acquire(&ptable.lock);
++  //Task 4
++  pushcli();
++  //End task 4
+ 
+   // Parent might be sleeping in wait().
+   wakeup1(curproc->parent);
+@@ -272,9 +300,14 @@ exit(void)
+         wakeup1(initproc);
+     }
+   }
+-
++  
++  //Task 4
++  if(!cas(&curproc->state, RUNNING, NEG_ZOMBIE)){
++    panic("\t***** CAS:Exit failed.");
++  }	
++  //End task 4
++	
+   // Jump into the scheduler, never to return.
+-  curproc->state = ZOMBIE;
+   sched();
+   panic("zombie exit");
+ }
+@@ -288,7 +321,7 @@ wait(void)
+   int havekids, pid;
+   struct proc *curproc = myproc();
+   
+-  acquire(&ptable.lock);
++  pushcli();
+   for(;;){
+     // Scan through table looking for exited children.
+     havekids = 0;
+@@ -296,7 +329,7 @@ wait(void)
+       if(p->parent != curproc)
+         continue;
+       havekids = 1;
+-      if(p->state == ZOMBIE){
++      if(cas(&(p->state), ZOMBIE, UNUSED)){
+         // Found one.
+         pid = p->pid;
+         kfree(p->kstack);
+@@ -306,15 +339,14 @@ wait(void)
+         p->parent = 0;
+         p->name[0] = 0;
+         p->killed = 0;
+-        p->state = UNUSED;
+-        release(&ptable.lock);
++        popcli();
+         return pid;
+       }
+     }
+ 
+     // No point waiting if we don't have any children.
+     if(!havekids || curproc->killed){
+-      release(&ptable.lock);
++      popcli();
+       return -1;
+     }
+ 
+@@ -343,27 +375,37 @@ scheduler(void)
+     sti();
+ 
+     // Loop over process table looking for process to run.
+-    acquire(&ptable.lock);
++    //task4
++	pushcli();
++	//end task 4
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-      if(p->state != RUNNABLE)
+-        continue;
++      if(!cas(&(p->state), RUNNABLE, RUNNING)) {
++          continue;
++      }
+ 
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
+       c->proc = p;
+       switchuvm(p);
+-      p->state = RUNNING;
+-
+       swtch(&(c->scheduler), p->context);
+       switchkvm();
+-
+-      // Process is done running for now.
++	  
++	  // Process is done running for now.
+       // It should have changed its p->state before coming back.
+-      c->proc = 0;
++	   c->proc = 0;
++	  
++	  //Task 4
++	   if(cas(&p->state, NEG_SLEEPING, SLEEPING)){
++          p->state = RUNNABLE;
++      }
++      cas(&p->state, NEG_RUNNABLE, RUNNABLE);
++      if(cas(&p->state, NEG_ZOMBIE, ZOMBIE)){
++        wakeup1(p->parent);
++      }
++	  //end task 4
+     }
+-    release(&ptable.lock);
+-
++    popcli();
+   }
+ }
+ 
+@@ -380,8 +422,6 @@ sched(void)
+   int intena;
+   struct proc *p = myproc();
+ 
+-  if(!holding(&ptable.lock))
+-    panic("sched ptable.lock");
+   if(mycpu()->ncli != 1)
+     panic("sched locks");
+   if(p->state == RUNNING)
+@@ -397,10 +437,14 @@ sched(void)
+ void
+ yield(void)
+ {
+-  acquire(&ptable.lock);  //DOC: yieldlock
+-  myproc()->state = RUNNABLE;
++	//task 4
++  pushcli();
++  if(!cas(&(myproc()->state), RUNNING, NEG_RUNNABLE)){
++       panic("\t***** CAS:Yield failed.");
++  }
+   sched();
+-  release(&ptable.lock);
++  popcli();
++  //end task 4
+ }
+ 
+ // A fork child's very first scheduling by scheduler()
+@@ -410,7 +454,7 @@ forkret(void)
+ {
+   static int first = 1;
+   // Still holding ptable.lock from scheduler.
+-  release(&ptable.lock);
++  popcli();
+ 
+   if (first) {
+     // Some initialization functions must be run in the context
+@@ -444,13 +488,16 @@ sleep(void *chan, struct spinlock *lk)
+   // (wakeup runs with ptable.lock locked),
+   // so it's okay to release lk.
+   if(lk != &ptable.lock){  //DOC: sleeplock0
+-    acquire(&ptable.lock);  //DOC: sleeplock1
++    pushcli();  //DOC: sleeplock1
+     release(lk);
+   }
+   // Go to sleep.
+-  p->chan = chan;
+-  p->state = SLEEPING;
++  //p->chan = chan;
+ 
++  do{
++	  p->chan = chan;
++  }while(!cas(&p->state, RUNNING, NEG_SLEEPING));
++  
+   sched();
+ 
+   // Tidy up.
+@@ -458,9 +505,10 @@ sleep(void *chan, struct spinlock *lk)
+ 
+   // Reacquire original lock.
+   if(lk != &ptable.lock){  //DOC: sleeplock2
+-    release(&ptable.lock);
++    popcli();
+     acquire(lk);
+   }
++  //end task 4
+ }
+ 
+ //PAGEBREAK!
+@@ -472,39 +520,43 @@ wakeup1(void *chan)
+   struct proc *p;
+ 
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+-    if(p->state == SLEEPING && p->chan == chan)
+-      p->state = RUNNABLE;
++	  //Task 4
++    if(p->chan == chan && (cas(&p->state,SLEEPING,NEG_RUNNABLE))){}
++	//end task 4
+ }
+ 
+ // Wake up all processes sleeping on chan.
+ void
+ wakeup(void *chan)
+ {
+-  acquire(&ptable.lock);
++  pushcli();
+   wakeup1(chan);
+-  release(&ptable.lock);
++  popcli();
+ }
+ 
+ // Kill the process with the given pid.
+ // Process won't exit until it returns
+ // to user space (see trap in trap.c).
+ int
+-kill(int pid)
++kill(int pid, int signum)
+ {
++  if(signum < 0 || signum >= SIG_SIZE){
++    return -1;
++  }
++	
+   struct proc *p;
+-
+-  acquire(&ptable.lock);
++  
++  pushcli();
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+     if(p->pid == pid){
+-      p->killed = 1;
+-      // Wake process from sleep if necessary.
+-      if(p->state == SLEEPING)
+-        p->state = RUNNABLE;
+-      release(&ptable.lock);
+-      return 0;
++      if(!(p->state == SLEEPING && signum == SIGSTOP)){
++        p->pending_signals = p->pending_signals | (1<<signum); // task 2.2.1
++      }
++	  popcli();
++	  return 0;
+     }
+   }
+-  release(&ptable.lock);
++  popcli();
+   return -1;
+ }
+ 
+@@ -519,10 +571,14 @@ procdump(void)
+   [UNUSED]    "unused",
+   [EMBRYO]    "embryo",
+   [SLEEPING]  "sleep ",
++  [NEG_SLEEPING] "neg_sleep",
+   [RUNNABLE]  "runble",
++  [NEG_RUNNABLE] "neg_runble",
+   [RUNNING]   "run   ",
+-  [ZOMBIE]    "zombie"
++  [ZOMBIE]    "zombie",
++  [NEG_ZOMBIE] "neg_zombie",
+   };
++  
+   int i;
+   struct proc *p;
+   char *state;
+@@ -544,3 +600,94 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
++//Task 2
++uint sigprocmask(uint sig_mask){
++	struct proc *curproc = myproc();
++	uint old = curproc->signal_mask;
++	curproc->signal_mask = sig_mask;
++	return old;
++}
++
++sighandler_t signal(int signum, sighandler_t handler){
++	if(signum < 0 || signum >= SIG_SIZE){
++		return (sighandler_t)-2;
++	}
++	
++	sighandler_t result;
++	struct proc *curproc = myproc();
++	result = curproc->signal_handlers[signum];
++	curproc->signal_handlers[signum] = handler;
++
++	return result;
++}
++
++void sigret(void){
++	struct proc *curproc = myproc();
++	memmove(curproc->tf,&curproc->tf_backup,sizeof(struct trapframe));
++	curproc->signal_mask = curproc->signal_mask_backup;
++}
++
++int is_masked(int mask, int signum){
++	return ((1 << signum) & mask) == (1 << signum);
++}
++
++int is_signal_pending(int pending_signals, int signum){
++	return ((1 << signum) & pending_signals) == (1 << signum);
++}
++
++void handle_user_signal(struct proc *p, int signum){
++	sighandler_t handler = p->signal_handlers[signum];
++
++	p->signal_mask_backup = p->signal_mask;
++	memmove(&p->tf_backup, p->tf, sizeof(struct trapframe));
++	
++	p->signal_mask = 0xffffffff;
++	p->tf->esp -= (uint)&call_sigret_end - (uint)&call_sigret_start;
++	memmove((void*)p->tf->esp, call_sigret_start, (uint)&call_sigret_end - (uint)&call_sigret_start);
++	*((int*)(p->tf->esp - 4)) = signum;
++	*((int*)(p->tf->esp - 8)) = p->tf->esp;
++	p->tf->esp -= 8;
++	p->tf->eip = (uint)handler;
++}
++
++void handle_kernel_signal(struct proc *p, int signum){	
++	switch(signum){
++		case SIGSTOP:
++			p->sig_stopped = 1;
++			break;
++		case SIGCONT:
++			p->sig_stopped = 0;
++			break;
++		case SIGKILL:
++		default:
++			p->killed = 1;
++			break;
++		break;
++	}
++}
++
++void handle_signals(struct trapframe *tf){
++	struct proc* curproc = myproc();
++	if(curproc == 0 || (tf->cs & 3) != DPL_USER){
++		return;
++	}
++	do{
++		if(curproc->sig_stopped && !is_signal_pending(curproc->pending_signals, SIGCONT)){
++			yield();
++		} else {
++			for(int i=0; i<SIG_SIZE; i++){
++				sighandler_t handler = curproc->signal_handlers[i];
++				if(handler == (sighandler_t)SIG_IGN || is_masked(curproc->signal_mask, i) || !is_signal_pending(curproc->pending_signals, i)){
++					continue;
++				}
++				if(handler == (sighandler_t)SIG_DFL){
++					handle_kernel_signal(curproc, i);
++				} else {
++					handle_user_signal(curproc, i);
++				}
++				curproc->pending_signals &= ~(1UL << i);
++			}
++		}
++	} while(curproc->sig_stopped);
++}
+\ No newline at end of file
+diff --git a/proc.h b/proc.h
+index 1647114..ffd44f9 100644
+--- a/proc.h
++++ b/proc.h
+@@ -1,3 +1,38 @@
++struct custom_trapframe {
++  // registers as pushed by pusha
++  uint edi;
++  uint esi;
++  uint ebp;
++  uint oesp;      // useless & ignored
++  uint ebx;
++  uint edx;
++  uint ecx;
++  uint eax;
++
++  // rest of trap frame
++  ushort gs;
++  ushort padding1;
++  ushort fs;
++  ushort padding2;
++  ushort es;
++  ushort padding3;
++  ushort ds;
++  ushort padding4;
++  uint trapno;
++
++  // below here defined by x86 hardware
++  uint err;
++  uint eip;
++  ushort cs;
++  ushort padding5;
++  uint eflags;
++
++  // below here only when crossing rings, such as from user to kernel
++  uint esp;
++  ushort ss;
++  ushort padding6;
++};
++
+ // Per-CPU state
+ struct cpu {
+   uchar apicid;                // Local APIC ID
+@@ -32,7 +67,8 @@ struct context {
+   uint eip;
+ };
+ 
+-enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++enum procstate { UNUSED, EMBRYO, SLEEPING,NEG_SLEEPING, RUNNABLE, NEG_RUNNABLE, RUNNING, ZOMBIE, NEG_ZOMBIE};
++
+ 
+ // Per-process state
+ struct proc {
+@@ -49,8 +85,19 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  
++  //Task 2.1.1
++  uint pending_signals;
++  uint signal_mask;
++  void* signal_handlers[SIG_SIZE];
++  uint signal_mask_backup;
++  int sig_stopped;
++  struct custom_trapframe tf_backup;
+ };
+ 
++int is_masked(int mask, int signum);
++int is_signal_pending(int pending_signals, int signum);
++
+ // Process memory is laid out contiguously, low addresses first:
+ //   text
+ //   original data and bss
+diff --git a/sig_sanity.c b/sig_sanity.c
+new file mode 100644
+index 0000000..1693984
+--- /dev/null
++++ b/sig_sanity.c
+@@ -0,0 +1,193 @@
++#include "types.h"
++#include "user.h"
++#include "fcntl.h"
++#include "param.h"
++
++void doWark();
++void dummy_handler();
++void dummy_handler2();
++void test_sig_kill();
++void test_sigprocmask();
++void test_signal();
++void test_sig_stop_cont();
++void test_override_sig_kill();
++void test_signal_communication();
++void test_sig_kill_communication();
++
++int main(int argc, char *argv[]){
++	switch (atoi(argv[1])){
++		case 1:
++			test_sig_stop_cont();
++			break;
++		case 2:
++			test_sig_kill();
++			break;
++		case 3:
++			test_sigprocmask();
++			break;
++		case 4:
++			test_signal();
++			break;
++		case 5:
++			test_override_sig_kill();
++			break;
++		case 6:
++			test_signal_communication();
++			break;
++		case 7:
++			test_sig_kill_communication();
++			break;
++		default:
++			printf(1,"There are 7 test function, but got : %d!!!",atoi(argv[1]));
++	}
++     exit();
++}
++
++void doWork(int pid){
++	printf(1, "Pid '%d' started doing work.\n", pid);
++	for (int i=0; i<50;i++){
++		printf(1,"Pid '%d' is printing %d.\n", pid, i);
++	}		
++	printf(1, "Pid '%d' finished.\n", pid);
++}
++
++void test_sig_stop_cont(){
++    printf(1,"Testing SIG_STOP and SIG_CONT.\n");
++	int pid = fork();
++	
++	if(pid == 0){
++		printf(1, "New process is running.\n");
++		doWork(getpid());
++		printf(1, "New process is stopping.\n");
++		kill(getpid(),SIGSTOP);
++		printf(1,"New process continued.\n");	
++		printf(1,"New process finished.\n");
++		exit();
++	}
++	else{
++		printf(1,"Original process going to sleep.\n");	
++		sleep(1500);
++		printf(1,"Original process after sleeping.\n");	
++		printf(1,"Original process sending signal -> SIGCONT on son.\n");	
++		kill(pid,SIGCONT);
++		printf(1,"Original process after sending signal SIGCONT.\n");
++		printf(1,"Original process waiting for son to finish.\n");			
++		wait();
++		printf(1,"Original process finishing work..\n");		
++	}
++	printf(1,"test_sig_stop_cont SUCCESS!\n");
++}
++
++void test_sig_kill(){
++	printf(1,"Testing SIG_KILL.\n");
++	
++    int pid = fork();
++    if(pid == 0){
++        printf(1, "test_sigKill running...\n");
++        kill(getpid(),SIGKILL);
++        printf(1, "test_sigKill FAIL!\n");
++    } else {
++        wait();
++        printf(1, "test_sigKill SUCCESS!\n");
++    }
++}
++ 
++void test_sigprocmask(){
++	printf(1,"Testing SIG_PROC_MASK.\n");
++	
++    int newMask = 1234;
++    int oldMask = sigprocmask(newMask);
++    if(newMask == sigprocmask(oldMask)){
++        printf(1, "test_sigprocmask  SUCCESS!\n");
++    } else {
++        printf(1, "test_sigprocmask FAIL!\n");
++    }
++}
++ 
++void test_signal(){
++	printf(1,"Testing SIGNAL.\n");
++	
++    int pid = fork();
++    int dummy_signal = 5;
++    if(pid == 0){
++        if((int)signal(dummy_signal, dummy_handler) != SIG_DFL){
++            printf(1,"test_signal FAIL!\n");
++        } else {
++            kill(getpid(), dummy_signal);
++            if(signal(dummy_signal, dummy_handler2) != dummy_handler){
++                printf(1, "test_signal FAIL!\n");
++            } else {
++                kill(getpid(), dummy_signal);
++            }
++        }
++    } else{
++        wait();
++        printf(1,"test_signal SUCCESS!\n");
++    }
++}
++
++void test_override_sig_kill(){
++	printf(1,"Testing OVERRIDE_SIG_KILL.\n");
++	
++	int pid = fork();
++
++	if(pid == 0){
++		if(signal(SIGSTOP,dummy_handler) < 0){
++			printf(1,"test_override_sig_kill FAIL!.\n");
++			exit();
++		}
++		printf(1,"New process is running\n.");
++		if(kill(getpid(),SIGSTOP) < 0){
++			printf(1,"test_override_sig_kill FAIL!.\n");
++			exit();
++		}// shouldn't stop
++		printf(1,"test_override_sig_kill SUCCESS\n.");
++	}
++
++	else{
++		wait();
++	}
++}
++
++void test_signal_communication(){
++	printf(1,"Testing SIGNAL_COMMUNICATION.\n");
++	
++    int pid = fork();
++    int dummy_signal = 5;
++    if(pid == 0){
++        if((int)signal(dummy_signal, dummy_handler) != SIG_DFL){
++            printf(1,"test_signal FAIL!\n");
++        } else {
++            sleep(1000);
++            kill(getpid(), SIGKILL);
++        }
++    } else{
++		sleep(100);
++        kill(pid, dummy_signal);
++        wait();
++        printf(1,"test_signal SUCCESS!\n");
++    }
++}
++
++void test_sig_kill_communication(){
++	printf(1,"Testing SIGNAL_KILL_COMMUNICATION.\n");
++	
++    int pid = fork();
++    if(pid == 0){
++        while(1);
++    } else {
++        if(kill(pid,SIGKILL) == -1){
++            printf(1, "test_sigKill FAIL!\n");
++        }
++        wait();
++        printf(1, "test_sigKill SUCCESS!\n");
++    }
++}
++ 
++void dummy_handler(int num){
++    printf(1, "dummy_handler called with %d\n", num);
++}
++ 
++void dummy_handler2(int num){
++    printf(1, "dummy_handler2 called with %d\n", num);
++}
+\ No newline at end of file
+diff --git a/syscall.c b/syscall.c
+index ee85261..42d891e 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,10 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++//Task 2
++extern int sys_sigprocmask(void);
++extern int sys_signal(void);
++extern int sys_sigret(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +130,9 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigprocmask] sys_sigprocmask,
++[SYS_signal] sys_signal,
++[SYS_sigret] sys_sigret
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..aa25537 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,7 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++//Task 2
++#define SYS_sigprocmask 22
++#define SYS_signal 23
++#define SYS_sigret 24
+\ No newline at end of file
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..306c0e2 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -29,11 +29,11 @@ sys_wait(void)
+ int
+ sys_kill(void)
+ {
+-  int pid;
++  int pid, signum;
+ 
+-  if(argint(0, &pid) < 0)
++  if(argint(0, &pid) < 0 || argint(1, &signum) < 0)
+     return -1;
+-  return kill(pid);
++  return kill(pid, signum);
+ }
+ 
+ int
+@@ -67,7 +67,7 @@ sys_sleep(void)
+   acquire(&tickslock);
+   ticks0 = ticks;
+   while(ticks - ticks0 < n){
+-    if(myproc()->killed){
++    if(myproc()->killed || (!is_masked(myproc()->signal_mask, SIGKILL) && is_signal_pending(myproc()->pending_signals, SIGKILL)) ){
+       release(&tickslock);
+       return -1;
+     }
+@@ -89,3 +89,31 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++//Task 2
++//Task 2
++uint 
++sys_sigprocmask(void){
++  int mask;
++
++  if(argint(0, &mask) < 0)
++    return -1;
++  return sigprocmask((uint)mask);
++}
++
++int
++sys_signal(void){
++  int signum;
++  char* handler;
++
++  if(argint(0, &signum) < 0 ||  argptr(1,&handler,sizeof(sighandler_t)) < 0)
++    return -2;
++  return (int)signal(signum, (sighandler_t)handler);
++}
++
++int
++sys_sigret(void){
++	sigret();
++	return myproc()->tf->eax;
++}
++
+diff --git a/trapasm.S b/trapasm.S
+index da8aefc..0abe489 100644
+--- a/trapasm.S
++++ b/trapasm.S
+@@ -23,6 +23,11 @@ alltraps:
+   # Return falls through to trapret...
+ .globl trapret
+ trapret:
++  #Start  task 2
++  pushl %esp
++  call handle_signals
++  add $4, %esp
++  #End task 2 
+   popal
+   popl %gs
+   popl %fs
+diff --git a/types.h b/types.h
+index e4adf64..0f0a482 100644
+--- a/types.h
++++ b/types.h
+@@ -2,3 +2,7 @@ typedef unsigned int   uint;
+ typedef unsigned short ushort;
+ typedef unsigned char  uchar;
+ typedef uint pde_t;
++
++//Task 2
++
++typedef void (*sighandler_t)(int);
+\ No newline at end of file
+diff --git a/user.h b/user.h
+index f45b8d5..e193634 100644
+--- a/user.h
++++ b/user.h
+@@ -9,7 +9,7 @@ int pipe(int*);
+ int write(int, void*, int);
+ int read(int, void*, int);
+ int close(int);
+-int kill(int);
++int kill(int, int);
+ int exec(char*, char**);
+ int open(char*, int);
+ int mknod(char*, short, short);
+@@ -24,6 +24,11 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ 
++//Task 2
++uint sigprocmask(uint);
++sighandler_t signal(int, sighandler_t);
++void sigret(void);
++
+ // ulib.c
+ int stat(char*, struct stat*);
+ char* strcpy(char*, char*);
+diff --git a/usertests.c b/usertests.c
+index a1e97e7..8b4f9a5 100644
+--- a/usertests.c
++++ b/usertests.c
+@@ -390,9 +390,9 @@ preempt(void)
+   }
+   close(pfds[0]);
+   printf(1, "kill... ");
+-  kill(pid1);
+-  kill(pid2);
+-  kill(pid3);
++  kill(pid1, SIGKILL);
++  kill(pid2, SIGKILL);
++  kill(pid3, SIGKILL);
+   printf(1, "wait... ");
+   wait();
+   wait();
+@@ -446,7 +446,7 @@ mem(void)
+     m1 = malloc(1024*20);
+     if(m1 == 0){
+       printf(1, "couldn't allocate mem?!!\n");
+-      kill(ppid);
++      kill(ppid, SIGKILL);
+       exit();
+     }
+     free(m1);
+@@ -1503,7 +1503,7 @@ sbrktest(void)
+     }
+     if(pid == 0){
+       printf(stdout, "oops could read %x = %x\n", a, *a);
+-      kill(ppid);
++      kill(ppid, SIGKILL);
+       exit();
+     }
+     wait();
+@@ -1532,7 +1532,7 @@ sbrktest(void)
+   for(i = 0; i < sizeof(pids)/sizeof(pids[0]); i++){
+     if(pids[i] == -1)
+       continue;
+-    kill(pids[i]);
++    kill(pids[i], SIGKILL);
+     wait();
+   }
+   if(c == (char*)0xffffffff){
+@@ -1576,7 +1576,7 @@ validatetest(void)
+     }
+     sleep(0);
+     sleep(0);
+-    kill(pid);
++    kill(pid, SIGKILL);
+     wait();
+ 
+     // try to crash the kernel by passing in a bad string pointer
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..61ecda0 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,7 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++# Task 2
++SYSCALL(sigprocmask)
++SYSCALL(signal)
++SYSCALL(sigret)
+diff --git a/x86.h b/x86.h
+index 07312a5..b9f6b6d 100644
+--- a/x86.h
++++ b/x86.h
+@@ -1,5 +1,17 @@
+ // Routines to let C code use special x86 instructions.
+ 
++
++//Assignment 2, Task 3.1.1:
++static inline int 
++cas(volatile void* addr, int expected, int newval) {
++	int result = 0;
++	asm volatile("lock; cmpxchgl %1, (%2); sete %%al;":// assembly code template 
++	  "=a"(result) : // output parameters 
++		"r"(newval), "b"(addr), "a"(expected) : // input params
++		"cc");
++	return result;
++}  
++
+ static inline uchar
+ inb(ushort port)
+ {
