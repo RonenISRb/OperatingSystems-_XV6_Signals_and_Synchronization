@@ -12,3 +12,9 @@ The assignment is composed of four main parts:
 2. Using the signal framework, create a multi process application.
 3. Add CAS support for XV6.
 4. Enhance the XV6 process management mechanism via a lock-free synchronization algorithm.
+
+# Run:
+ Start XV6 os: "make clean qemu".
+ 
+ # Tests:
+ Start XV6, enter "usertest".
